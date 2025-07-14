@@ -1,5 +1,5 @@
 #!/bin/bash
-# mariadb_backup.sh
+# mariadb_backup.sh (Hybrid Mode: Prepared Fulls, Raw Incrementals + Compression)
 
 # Load config
 source /usr/local/etc/mariadb_backup/backup.conf
@@ -32,6 +32,28 @@ INC_BACKUP_DIR="$SET_DIR/inc-$TODAY"
 
 mkdir -p "$SET_DIR"
 
+compress_and_upload() {
+    SOURCE_DIR="$1"
+    DEST_SUBPATH="$2"
+
+    TAR_FILE="${SOURCE_DIR}.tar.zst"
+
+    echo -e "${YELLOW}Compressing $SOURCE_DIR to $TAR_FILE...${NC}"
+    tar --zstd -cf "$TAR_FILE" -C "$(dirname "$SOURCE_DIR")" "$(basename "$SOURCE_DIR")"
+
+    if [ "$USE_AZCOPY" -eq 1 ]; then
+        echo -e "${YELLOW}Uploading $TAR_FILE to Azure blob storage...${NC}"
+        $AZCOPY_PATH copy "$TAR_FILE" "$CONTAINER_URL/$DEST_SUBPATH.tar.zst"
+    else
+        echo -e "${YELLOW}Moving $TAR_FILE to local blob mount...${NC}"
+        mkdir -p "$LOCAL_BLOB_MOUNT/$(dirname "$DEST_SUBPATH")"
+        mv "$TAR_FILE" "$LOCAL_BLOB_MOUNT/$DEST_SUBPATH.tar.zst"
+    fi
+
+    # Cleanup original folder after compression
+    rm -rf "$SOURCE_DIR"
+}
+
 do_full_backup() {
     echo -e "${YELLOW}[$(date)] Starting FULL backup...${NC}"
     rm -rf "$FULL_BACKUP_DIR"
@@ -39,33 +61,22 @@ do_full_backup() {
 
     mariabackup --backup --target-dir="$FULL_BACKUP_DIR" --user="$DB_USER" --password="$DB_PASSWORD"
     mariabackup --prepare --target-dir="$FULL_BACKUP_DIR"
-    echo -e "${GREEN}[$(date)] Full backup complete.${NC}"
 
-    upload_backup "$FULL_BACKUP_DIR" "set-$SET_DATE/full-$SET_DATE"
+    echo -e "${GREEN}[$(date)] Full backup complete and prepared.${NC}"
+    compress_and_upload "$FULL_BACKUP_DIR" "set-$SET_DATE/full-$SET_DATE"
 }
 
 do_incremental_backup() {
     echo -e "${YELLOW}[$(date)] Starting INCREMENTAL backup...${NC}"
     mkdir -p "$INC_BACKUP_DIR"
 
-    mariabackup --backup --target-dir="$INC_BACKUP_DIR" --incremental-basedir="$FULL_BACKUP_DIR" --user="$DB_USER" --password="$DB_PASSWORD"
-    echo -e "${GREEN}[$(date)] Incremental backup complete.${NC}"
+    mariabackup --backup \
+        --target-dir="$INC_BACKUP_DIR" \
+        --incremental-basedir="$FULL_BACKUP_DIR" \
+        --user="$DB_USER" --password="$DB_PASSWORD"
 
-    upload_backup "$INC_BACKUP_DIR" "set-$SET_DATE/inc-$TODAY"
-}
-
-upload_backup() {
-    SOURCE_DIR="$1"
-    DEST_SUBPATH="$2"
-
-    if [ "$USE_AZCOPY" -eq 1 ]; then
-        echo -e "${YELLOW}Uploading $SOURCE_DIR to Azure blob storage...${NC}"
-        $AZCOPY_PATH copy "$SOURCE_DIR" "$CONTAINER_URL/$DEST_SUBPATH" --recursive
-    else
-        echo -e "${YELLOW}Moving $SOURCE_DIR to local blob mount...${NC}"
-        mkdir -p "$LOCAL_BLOB_MOUNT/$(dirname "$DEST_SUBPATH")"
-        mv "$SOURCE_DIR" "$LOCAL_BLOB_MOUNT/$DEST_SUBPATH"
-    fi
+    echo -e "${GREEN}[$(date)] Incremental backup complete (unprepared).${NC}"
+    compress_and_upload "$INC_BACKUP_DIR" "set-$SET_DATE/inc-$TODAY"
 }
 
 cleanup_old_backups() {
@@ -80,23 +91,16 @@ cleanup_old_backups() {
 # Main
 if [ "$WEEKDAY" -eq 5 ]; then
     do_full_backup
+    BACKUP_TYPE="Full Backup (Prepared & Compressed)"
 else
     do_incremental_backup
+    BACKUP_TYPE="Incremental Backup (Unprepared & Compressed)"
 fi
 
 cleanup_old_backups
-
-# Capture backup process exit status
 EXIT_CODE=$?
 
-# Determine backup type
-if [ "$WEEKDAY" -eq 5 ]; then
-    BACKUP_TYPE="Full Backup"
-else
-    BACKUP_TYPE="Incremental Backup"
-fi
-
-# Fancy email body
+# Compose email
 EMAIL_BODY=$(cat <<EOF
 MariaDB Backup Report
 ======================
@@ -105,24 +109,13 @@ Server: $HOSTNAME_SHORT (IP: $IP_LAST_TWO)
 Backup Type: $BACKUP_TYPE
 Date: $(date +"%Y-%m-%d %H:%M:%S")
 
-EOF
-)
-
-# Compose and send email
-if [ "$EXIT_CODE" -eq 0 ]; then
-    EMAIL_BODY+="
-Backup Result: SUCCESS
+Backup Result: $(if [ "$EXIT_CODE" -eq 0 ]; then echo "SUCCESS"; else echo "FAILURE"; fi)
 
 Local Backup Path: $SET_DIR
 Upload Method: $(if [ "$USE_AZCOPY" -eq 1 ]; then echo "Azure Blob (azcopy)"; else echo "Local Move (mv)"; fi)
 Retention Cleanup: Completed
-"
-    echo "$EMAIL_BODY" | mail -s "✅ MariaDB Backup Successful [$BACKUP_TYPE]" "$NOTIFY_EMAIL"
-else
-    EMAIL_BODY+="
-Backup Result: FAILURE
+EOF
+)
 
-Error detected during backup. Check /var/log/mariadb_backup.log for details.
-"
-    echo "$EMAIL_BODY" | mail -s "❌ MariaDB Backup FAILED [$BACKUP_TYPE]" "$NOTIFY_EMAIL"
-fi
+SUBJECT_PREFIX=$(if [ "$EXIT_CODE" -eq 0 ]; then echo "✅"; else echo "❌"; fi)
+echo "$EMAIL_BODY" | mail -s "$SUBJECT_PREFIX MariaDB Backup [$BACKUP_TYPE]" "$NOTIFY_EMAIL"
