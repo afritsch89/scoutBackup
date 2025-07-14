@@ -10,6 +10,23 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
 
+# Default: do not force full backup
+FORCE_FULL=0
+
+# Parse CLI arguments
+while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+        -f|--force-full)
+            FORCE_FULL=1
+            ;;
+        *)
+            echo -e "${RED}Unknown option: $1${NC}"
+            exit 1
+            ;;
+    esac
+    shift
+done
+
 # Dates
 TODAY=$(date +"%Y-%m-%d")
 WEEKDAY=$(date +%u)  # 5 = Friday
@@ -20,7 +37,7 @@ SERVER_IP=$(hostname -I | awk '{print $1}')
 IP_LAST_TWO=$(echo "$SERVER_IP" | awk -F. '{print $(NF-1)"."$NF}')
 
 # Determine backup set
-if [ "$WEEKDAY" -eq 5 ]; then
+if [ "$WEEKDAY" -eq 5 ] || [ "$FORCE_FULL" -eq 1 ]; then
     SET_DATE="$TODAY"
 else
     SET_DATE=$(date -d "last Friday" +"%Y-%m-%d")
@@ -89,7 +106,7 @@ cleanup_old_backups() {
 }
 
 # Main
-if [ "$WEEKDAY" -eq 5 ]; then
+if [ "$WEEKDAY" -eq 5 ] || [ "$FORCE_FULL" -eq 1 ]; then
     do_full_backup
     BACKUP_TYPE="Full Backup (Prepared & Compressed)"
 else
