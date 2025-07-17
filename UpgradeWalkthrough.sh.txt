@@ -10,7 +10,7 @@ rm -fr /maria/backups/prePatch
 
 #set open files to mitigate backup issues...
 ulimit -n 8192
-mariabackup -umariabackup -pChr@M@riaB@ckUP1885 --backup --target-dir='/maria/backups/prePatch'
+mariabackup -umariabackup -pPASSWORDGOESHERE --backup --target-dir='/maria/backups/prePatch'
 
 
 
